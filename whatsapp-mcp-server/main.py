@@ -12,7 +12,9 @@ from whatsapp import (
     send_message as whatsapp_send_message,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
-    download_media as whatsapp_download_media
+    download_media as whatsapp_download_media,
+    list_all_contacts as whatsapp_list_all_contacts,
+    sync_history as whatsapp_sync_history,
 )
 
 # Initialize FastMCP server
@@ -245,6 +247,47 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
             "success": False,
             "message": "Failed to download media"
         }
+
+
+@mcp.tool()
+def list_all_contacts() -> Dict[str, Any]:
+    """Return the user's full WhatsApp address book (all contacts the
+    phone has synced to the bridge). This is the *reliable* source for
+    contacts — much larger than messages.db, which only contains chats
+    the user has actually exchanged messages in.
+
+    Use this when search_contacts returns too few results, or when the
+    user asks for "everyone" or "all contacts".
+
+    Returns: {"count": int, "contacts": [{jid, phone_number,
+    display_name, first_name, full_name, push_name, business_name}]}
+    """
+    contacts = whatsapp_list_all_contacts()
+    return {"count": len(contacts), "contacts": contacts}
+
+
+@mcp.tool()
+def sync_history(chat_jid: str, count: int = 50) -> Dict[str, Any]:
+    """Ask the user's phone for older messages in a specific chat.
+
+    WhatsApp's HistorySyncOnDemand protocol is per-chat back-pagination.
+    The phone may take 30+ seconds to respond, may ignore the request,
+    or may only return a handful of messages. After this returns, wait
+    a few seconds then call list_messages(chat_jid=...) to read what
+    arrived. A 30-second cooldown is enforced per call to avoid
+    flooding the WhatsApp servers.
+
+    Args:
+        chat_jid: The chat to fetch history for (e.g.,
+                  "917000189190@s.whatsapp.net" for a 1:1 chat,
+                  "...@g.us" for a group).
+        count: Max messages to ask for (default 50, server-capped at 100).
+
+    Returns: {request_accepted, error?, cooldown_remaining_sec?,
+              anchor_synthetic, last_attempt}
+    """
+    return whatsapp_sync_history(chat_jid, count)
+
 
 if __name__ == "__main__":
     # Initialize and run the server

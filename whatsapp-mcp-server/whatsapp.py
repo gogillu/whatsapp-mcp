@@ -1,14 +1,27 @@
 import sqlite3
 from datetime import datetime
 from dataclasses import dataclass
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict, Any
 import os.path
 import requests
 import json
 import audio
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
-WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
+WHATSAPP_API_BASE_URL = os.environ.get("WHATSAPP_API_BASE_URL", "http://127.0.0.1:9876/api")
+
+
+def _open_messages_db() -> sqlite3.Connection:
+    """Open messages.db with WAL + busy_timeout. The Go bridge writes
+    concurrently; without these pragmas readers see SQLITE_BUSY when
+    handleHistorySync inserts in bulk."""
+    conn = sqlite3.connect(MESSAGES_DB_PATH, timeout=10)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA busy_timeout=5000;")
+    except sqlite3.Error:
+        pass
+    return conn
 
 @dataclass
 class Message:
@@ -391,45 +404,90 @@ def list_chats(
 
 
 def search_contacts(query: str) -> List[Contact]:
-    """Search contacts by name or phone number."""
+    """Search contacts by name or phone number.
+
+    Primary source: whatsmeow's full address book via the bridge
+    /api/contacts endpoint (~1485 entries). Falls back to messages.db
+    if the bridge is offline.
+    """
+    # Try bridge first — it has the full synced address book.
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        url = f"{WHATSAPP_API_BASE_URL}/contacts"
+        if query:
+            url += f"?q={requests.utils.quote(query)}"
+        r = requests.get(url, timeout=10)
+        if r.ok:
+            payload = r.json()
+            if payload.get("success"):
+                result: List[Contact] = []
+                for c in payload.get("contacts", []) or []:
+                    result.append(Contact(
+                        phone_number=c.get("phone_number") or c.get("jid", "").split("@")[0],
+                        name=c.get("display_name") or c.get("push_name") or c.get("full_name") or None,
+                        jid=c.get("jid", ""),
+                    ))
+                return result
+    except Exception as exc:
+        print(f"bridge contacts unavailable, falling back to messages.db: {exc}")
+
+    # Fallback: messages.db chat list (only chats the user has
+    # already messaged — sparse on a fresh install).
+    try:
+        conn = _open_messages_db()
         cursor = conn.cursor()
-        
-        # Split query into characters to support partial matching
-        search_pattern = '%' +query + '%'
-        
+        search_pattern = '%' + query + '%'
         cursor.execute("""
-            SELECT DISTINCT 
-                jid,
-                name
+            SELECT DISTINCT jid, name
             FROM chats
-            WHERE 
-                (LOWER(name) LIKE LOWER(?) OR LOWER(jid) LIKE LOWER(?))
-                AND jid NOT LIKE '%@g.us'
+            WHERE (LOWER(name) LIKE LOWER(?) OR LOWER(jid) LIKE LOWER(?))
+              AND jid NOT LIKE '%@g.us'
             ORDER BY name, jid
             LIMIT 50
         """, (search_pattern, search_pattern))
-        
         contacts = cursor.fetchall()
-        
-        result = []
-        for contact_data in contacts:
-            contact = Contact(
-                phone_number=contact_data[0].split('@')[0],
-                name=contact_data[1],
-                jid=contact_data[0]
-            )
-            result.append(contact)
-            
-        return result
-        
+        return [
+            Contact(phone_number=row[0].split('@')[0], name=row[1], jid=row[0])
+            for row in contacts
+        ]
     except sqlite3.Error as e:
         print(f"Database error: {e}")
         return []
     finally:
         if 'conn' in locals():
             conn.close()
+
+
+def list_all_contacts() -> List[Dict[str, Any]]:
+    """Return the full WhatsApp address book known to the bridge
+    (whatsmeow's contact store). Uses /api/contacts."""
+    try:
+        r = requests.get(f"{WHATSAPP_API_BASE_URL}/contacts", timeout=15)
+        r.raise_for_status()
+        payload = r.json()
+        if not payload.get("success"):
+            return []
+        return payload.get("contacts", []) or []
+    except Exception as exc:
+        print(f"list_all_contacts failed: {exc}")
+        return []
+
+
+def sync_history(chat_jid: str, count: int = 50) -> Dict[str, Any]:
+    """Ask the phone for older messages in a specific chat.
+    Best-effort: WhatsApp's HistorySyncOnDemand may take 30s+ or be
+    silently ignored. Cooldown is 30s per call. After this returns,
+    poll list_messages(chat_jid=...) a few seconds later."""
+    body = {"chat_jid": chat_jid, "count": int(count)}
+    try:
+        r = requests.post(f"{WHATSAPP_API_BASE_URL}/sync-history",
+                          json=body, timeout=45)
+        try:
+            return r.json()
+        except Exception:
+            return {"request_accepted": False,
+                    "error": f"non-json response: {r.status_code} {r.text[:200]}"}
+    except Exception as exc:
+        return {"request_accepted": False, "error": str(exc)}
 
 
 def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:

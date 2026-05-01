@@ -13,12 +13,16 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 	"github.com/mdp/qrterminal"
+	qrgen "rsc.io/qr"
 
 	"bytes"
 
@@ -53,8 +57,10 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to create store directory: %v", err)
 	}
 
-	// Open SQLite database for messages
-	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on")
+	// Open SQLite database for messages.
+	// WAL + busy_timeout reduces SQLITE_BUSY contention between the
+	// Go writer (handleMessage / handleHistorySync) and Python readers.
+	db, err := sql.Open("sqlite", "file:store/messages.db?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open message database: %v", err)
 	}
@@ -641,7 +647,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -677,6 +683,192 @@ func extractDirectPathFromURL(url string) string {
 
 // Start a REST API server to expose the WhatsApp client functionality
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+	// Handler: list all WhatsApp contacts known to the multi-device
+	// session. This is RELIABLE — whatsmeow keeps a synced contact
+	// store from the phone, with full names, push names, and business
+	// names. Useful when messages.db is sparse (right after pairing).
+	http.HandleFunc("/api/contacts", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer cancel()
+		contacts, err := client.Store.Contacts.GetAllContacts(ctx)
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]any{
+				"success": false,
+				"message": err.Error(),
+			})
+			return
+		}
+		queryParam := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("q")))
+		out := make([]map[string]any, 0, len(contacts))
+		for jid, ci := range contacts {
+			displayName := ci.FullName
+			if displayName == "" {
+				displayName = ci.PushName
+			}
+			if displayName == "" {
+				displayName = ci.BusinessName
+			}
+			if queryParam != "" {
+				hay := strings.ToLower(displayName + " " + ci.PushName + " " + ci.BusinessName + " " + jid.User)
+				if !strings.Contains(hay, queryParam) {
+					continue
+				}
+			}
+			out = append(out, map[string]any{
+				"jid":           jid.String(),
+				"phone_number":  jid.User,
+				"display_name":  displayName,
+				"first_name":    ci.FirstName,
+				"full_name":     ci.FullName,
+				"push_name":     ci.PushName,
+				"business_name": ci.BusinessName,
+			})
+		}
+		// Sort alphabetically by display_name (case-insensitive) so
+		// the result is deterministic and friendly.
+		sortContacts(out)
+		json.NewEncoder(w).Encode(map[string]any{
+			"success":  true,
+			"count":    len(out),
+			"contacts": out,
+		})
+	})
+
+	// Handler: best-effort per-chat history sync. EXPERIMENTAL.
+	// The phone may take 30s+ to respond, may ignore the request, or
+	// may only return duplicates. Use sparingly. Cooldown is enforced
+	// at the bridge level (30s per call) to avoid spamming WhatsApp.
+	//
+	// Body: {chat_jid: string, count: int (default 50, max 100)}
+	// Returns: {request_accepted, error, cooldown_remaining_sec,
+	//           in_flight, last_attempt, anchor}
+	http.HandleFunc("/api/sync-history", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			ChatJID string `json:"chat_jid"`
+			Count   int    `json:"count"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.ChatJID == "" {
+			http.Error(w, `{"error":"chat_jid required"}`, http.StatusBadRequest)
+			return
+		}
+		if req.Count <= 0 {
+			req.Count = 50
+		} else if req.Count > 100 {
+			req.Count = 100
+		}
+
+		// Cooldown / in-flight check
+		historySyncMu.Lock()
+		now := time.Now()
+		remaining := historySyncCooldown - now.Sub(historySyncLastAttempt)
+		if historySyncInFlight {
+			historySyncMu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			json.NewEncoder(w).Encode(map[string]any{
+				"request_accepted": false,
+				"in_flight":        true,
+				"error":            "another history-sync request is in flight",
+			})
+			return
+		}
+		if !historySyncLastAttempt.IsZero() && remaining > 0 {
+			historySyncMu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			json.NewEncoder(w).Encode(map[string]any{
+				"request_accepted":        false,
+				"cooldown_remaining_sec":  int(remaining.Seconds()) + 1,
+				"last_attempt":            historySyncLastAttempt.Format(time.RFC3339),
+				"error":                   "cooldown active",
+			})
+			return
+		}
+		historySyncInFlight = true
+		historySyncLastAttempt = now
+		historySyncMu.Unlock()
+
+		defer func() {
+			historySyncMu.Lock()
+			historySyncInFlight = false
+			historySyncMu.Unlock()
+		}()
+
+		// Look up the most-recent stored message for this chat to use
+		// as the anchor (whatsmeow back-paginates from anchor->older).
+		var (
+			anchorID    string
+			anchorTS    time.Time
+			anchorIsMe  bool
+			anchorFound bool
+		)
+		row := messageStore.db.QueryRow(`
+			SELECT id, timestamp, is_from_me FROM messages
+			WHERE chat_jid = ?
+			ORDER BY timestamp ASC LIMIT 1`, req.ChatJID)
+		if err := row.Scan(&anchorID, &anchorTS, &anchorIsMe); err == nil {
+			anchorFound = true
+		}
+
+		chatJID, err := types.ParseJID(req.ChatJID)
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]any{
+				"request_accepted": false,
+				"error":            fmt.Sprintf("invalid chat_jid: %v", err),
+			})
+			return
+		}
+
+		// If we have no anchor, synthesize one with time.Now() so the
+		// phone is asked for messages older than "now" in this chat.
+		// This is best-effort — whatsmeow's protocol prefers a real
+		// stored anchor message, and the phone may ignore the request.
+		if !anchorFound {
+			anchorID = "synthetic-anchor"
+			anchorTS = time.Now()
+			anchorIsMe = false
+		}
+		anchor := &types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Chat:     chatJID,
+				Sender:   chatJID,
+				IsFromMe: anchorIsMe,
+			},
+			ID:        anchorID,
+			Timestamp: anchorTS,
+		}
+
+		err = requestHistorySync(client, anchor, req.Count)
+		w.Header().Set("Content-Type", "application/json")
+		resp := map[string]any{
+			"request_accepted":   err == nil,
+			"in_flight":          false,
+			"anchor_synthetic":   !anchorFound,
+			"chat_jid":           req.ChatJID,
+			"count":              req.Count,
+			"last_attempt":       historySyncLastAttempt.Format(time.RFC3339),
+			"note":               "history sync events arrive asynchronously and are persisted to messages.db. Poll the messages table after a few seconds.",
+		}
+		if err != nil {
+			resp["error"] = err.Error()
+			w.WriteHeader(http.StatusBadGateway)
+		}
+		json.NewEncoder(w).Encode(resp)
+	})
+
 	// Handler for sending messages
 	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
@@ -774,8 +966,10 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
-	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
+	// Bind to loopback only so the bridge isn't exposed on the LAN.
+	// Port is configurable via WHATSAPP_BRIDGE_PORT (default 9876, picked
+	// to avoid colliding with the god backend on 9871/9872/9873).
+	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
 
 	// Run server in a goroutine so it doesn't block
@@ -800,14 +994,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite", "file:store/whatsapp.db?_pragma=foreign_keys(1)", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -866,13 +1060,25 @@ func main() {
 			return
 		}
 
-		// Print QR code for pairing with phone
+		// Print QR code for pairing with phone (terminal) AND write a PNG
+		// to apache so the user can scan it from a browser - the bridge
+		// often runs unattended via Task Scheduler where stdout is hidden.
 		for evt := range qrChan {
 			if evt.Event == "code" {
 				fmt.Println("\nScan this QR code with your WhatsApp app:")
 				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+				if code, err := qrgen.Encode(evt.Code, qrgen.M); err == nil {
+					png := code.PNG()
+					_ = os.MkdirAll(`C:\Users\arushi\apache-www\god\whatsapp`, 0o755)
+					qrPath := `C:\Users\arushi\apache-www\god\whatsapp\qr.png`
+					if err := os.WriteFile(qrPath, png, 0o644); err == nil {
+						fmt.Printf("QR PNG also written to %s\n", qrPath)
+						fmt.Println("Open https://gogillu.in:9871/whatsapp/qr.png (or http://20.244.37.91/god/whatsapp/qr.png) and scan with WhatsApp -> Linked devices.")
+					}
+				}
 			} else if evt.Event == "success" {
 				connected <- true
+				_ = os.Remove(`C:\Users\arushi\apache-www\god\whatsapp\qr.png`)
 				break
 			}
 		}
@@ -905,8 +1111,15 @@ func main() {
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
-	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
+	// Start REST API server. Port is overridable via env so the bridge
+	// can dodge whatever the god backend is using on this machine.
+	bridgePort := 9876
+	if v := strings.TrimSpace(os.Getenv("WHATSAPP_BRIDGE_PORT")); v != "" {
+		if p, err := strconv.Atoi(v); err == nil && p > 0 && p < 65536 {
+			bridgePort = p
+		}
+	}
+	startRESTServer(client, messageStore, bridgePort)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
@@ -973,7 +1186,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,7 +1201,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {
@@ -1147,40 +1360,51 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 	fmt.Printf("History sync complete. Stored %d messages.\n", syncedCount)
 }
 
-// Request history sync from the server
-func requestHistorySync(client *whatsmeow.Client) {
+// Cooldown state for /api/sync-history. Prevents rapid-fire history
+// requests from spamming the WhatsApp peer protocol when the MCP server
+// retries (or when multiple clients call simultaneously).
+var (
+	historySyncMu             sync.Mutex
+	historySyncInFlight       bool
+	historySyncLastAttempt    time.Time
+	historySyncCooldown       = 30 * time.Second
+)
+
+// requestHistorySync asks the phone (our primary device) for up to
+// `count` messages older than `anchor` in the chat indicated by
+// anchor.Chat. anchor must be a real, previously-stored message —
+// whatsmeow's HistorySyncOnDemandRequest is per-chat back-pagination,
+// not a "give me everything" backfill. (For pre-pair backfill the
+// proven path is RequireFullSync at pair-time, which is too late here.)
+func requestHistorySync(client *whatsmeow.Client, anchor *types.MessageInfo, count int) error {
 	if client == nil {
-		fmt.Println("Client is not initialized. Cannot request history sync.")
-		return
+		return fmt.Errorf("client is not initialized")
 	}
-
 	if !client.IsConnected() {
-		fmt.Println("Client is not connected. Please ensure you are connected to WhatsApp first.")
-		return
+		return fmt.Errorf("client is not connected to WhatsApp")
 	}
-
 	if client.Store.ID == nil {
-		fmt.Println("Client is not logged in. Please scan the QR code first.")
-		return
+		return fmt.Errorf("client is not logged in")
+	}
+	if anchor == nil {
+		return fmt.Errorf("anchor message is required (whatsmeow needs a real per-chat anchor)")
+	}
+	if count <= 0 {
+		count = 50
 	}
 
-	// Build and send a history sync request
-	historyMsg := client.BuildHistorySyncRequest(nil, 100)
+	historyMsg := client.BuildHistorySyncRequest(anchor, count)
 	if historyMsg == nil {
-		fmt.Println("Failed to build history sync request.")
-		return
+		return fmt.Errorf("failed to build history sync request")
 	}
 
-	_, err := client.SendMessage(context.Background(), types.JID{
-		Server: "s.whatsapp.net",
-		User:   "status",
-	}, historyMsg)
-
-	if err != nil {
-		fmt.Printf("Failed to request history sync: %v\n", err)
-	} else {
-		fmt.Println("History sync requested. Waiting for server response...")
-	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	// SendPeerMessage routes via the multi-device protocol to our own
+	// linked devices (the phone), bypassing the usync pipeline that
+	// times out when sending to status@s.whatsapp.net.
+	_, err := client.SendPeerMessage(ctx, historyMsg)
+	return err
 }
 
 // analyzeOggOpus tries to extract duration and generate a simple waveform from an Ogg Opus file
@@ -1345,4 +1569,15 @@ func placeholderWaveform(duration uint32) []byte {
 	}
 
 	return waveform
+}
+
+
+// sortContacts orders the contacts slice in-place alphabetically by
+// display_name, case-insensitively. Used by /api/contacts.
+func sortContacts(rows []map[string]any) {
+sort.SliceStable(rows, func(i, j int) bool {
+ai, _ := rows[i]["display_name"].(string)
+aj, _ := rows[j]["display_name"].(string)
+return strings.ToLower(ai) < strings.ToLower(aj)
+})
 }
