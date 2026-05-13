@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -915,6 +916,76 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Handler for the god-scheduler stop/continue intent check.
+	//
+	// Returns the latest control reply (`stop#<code>` or
+	// `continue#<code>` on its own line, case-insensitive) found in
+	// any chat. The scheduler uses this to honour opt-outs from
+	// recipients of recurring WhatsApp reminders without needing
+	// direct file-system access to the bridge's messages.db (which
+	// matters for the Business bridge running on EC2, where the
+	// scheduler talks over HTTPS via Apache reverse proxy).
+	//
+	// Query params:
+	//   recipient — phone / JID / contact (currently informational;
+	//               match is global because stop codes are unique
+	//               per-task and LID migrations make chat_jid
+	//               unreliable). Kept in the API for forward compat.
+	//   stopCode  — the unique stop code emitted on each task.
+	//
+	// Response (always 200 unless DB error):
+	//   { "intent": "stop"|"continue"|"none",
+	//     "content": "<message body that matched, if any>",
+	//     "messageId": "<messages.id PK of the match, if any>" }
+	http.HandleFunc("/api/latest-intent", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		stopCode := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("stopCode")))
+		if stopCode == "" {
+			http.Error(w, "stopCode is required", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		needle := "%#" + stopCode + "%"
+		rows, err := messageStore.db.Query(
+			"SELECT id, content FROM messages WHERE lower(content) LIKE ? ORDER BY timestamp DESC LIMIT 50",
+			needle,
+		)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		defer rows.Close()
+		cmdRe, err := regexp.Compile(`(?im)^[\s>"'*_~]*(stop|continue)#` + regexp.QuoteMeta(stopCode) + `[\s.!?,;:"'*_~]*$`)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		resp := map[string]string{"intent": "none", "content": "", "messageId": ""}
+		for rows.Next() {
+			var id, body string
+			if scanErr := rows.Scan(&id, &body); scanErr != nil {
+				continue
+			}
+			m := cmdRe.FindStringSubmatch(body)
+			if m == nil {
+				continue
+			}
+			cmd := strings.ToLower(m[1])
+			if cmd == "stop" || cmd == "continue" {
+				resp["intent"] = cmd
+				resp["content"] = body
+				resp["messageId"] = id
+				break
+			}
+		}
+		json.NewEncoder(w).Encode(resp)
+	})
+
 	// Handler for downloading media
 	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
@@ -1063,22 +1134,34 @@ func main() {
 		// Print QR code for pairing with phone (terminal) AND write a PNG
 		// to apache so the user can scan it from a browser - the bridge
 		// often runs unattended via Task Scheduler where stdout is hidden.
+		// QR PNG output path is overridable via WHATSAPP_QR_PATH so a
+		// second instance (e.g. a Business account on EC2) can pair
+		// without trampling the personal account's QR file. An optional
+		// WHATSAPP_QR_URL prints a friendly scan-this-URL line.
+		qrPath := strings.TrimSpace(os.Getenv("WHATSAPP_QR_PATH"))
+		if qrPath == "" {
+			qrPath = `C:\Users\arushi\apache-www\god\whatsapp\qr.png`
+		}
+		qrURL := strings.TrimSpace(os.Getenv("WHATSAPP_QR_URL"))
 		for evt := range qrChan {
 			if evt.Event == "code" {
 				fmt.Println("\nScan this QR code with your WhatsApp app:")
 				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
 				if code, err := qrgen.Encode(evt.Code, qrgen.M); err == nil {
 					png := code.PNG()
-					_ = os.MkdirAll(`C:\Users\arushi\apache-www\god\whatsapp`, 0o755)
-					qrPath := `C:\Users\arushi\apache-www\god\whatsapp\qr.png`
+					_ = os.MkdirAll(filepath.Dir(qrPath), 0o755)
 					if err := os.WriteFile(qrPath, png, 0o644); err == nil {
 						fmt.Printf("QR PNG also written to %s\n", qrPath)
-						fmt.Println("Open https://gogillu.in:9871/whatsapp/qr.png (or http://20.244.37.91/god/whatsapp/qr.png) and scan with WhatsApp -> Linked devices.")
+						if qrURL != "" {
+							fmt.Printf("Open %s and scan with WhatsApp -> Linked devices.\n", qrURL)
+						} else {
+							fmt.Println("Open https://gogillu.in:9871/whatsapp/qr.png (or http://20.244.37.91/god/whatsapp/qr.png) and scan with WhatsApp -> Linked devices.")
+						}
 					}
 				}
 			} else if evt.Event == "success" {
 				connected <- true
-				_ = os.Remove(`C:\Users\arushi\apache-www\god\whatsapp\qr.png`)
+				_ = os.Remove(qrPath)
 				break
 			}
 		}
