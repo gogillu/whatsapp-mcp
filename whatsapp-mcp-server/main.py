@@ -1,3 +1,7 @@
+import os
+import sys
+import threading
+import time
 from typing import List, Dict, Any, Optional
 from mcp.server.fastmcp import FastMCP
 from whatsapp import (
@@ -16,6 +20,87 @@ from whatsapp import (
     list_all_contacts as whatsapp_list_all_contacts,
     sync_history as whatsapp_sync_history,
 )
+
+
+# --- Orphan-process watchdog ------------------------------------------------
+#
+# This MCP server is launched as a stdio child of the MCP host (Copilot CLI,
+# Claude Desktop, etc.) via `uv run main.py`. When the host crashes or is
+# killed ungracefully, the chain (host → uv → python) can end up with the
+# python child orphaned: its stdin pipe is broken but FastMCP's anyio loop
+# stays parked waiting for the next request and never notices. Result: every
+# host crash leaks one whatsapp-mcp python process.
+#
+# Two cheap watchdogs fix this:
+#   1. Parent-PID watchdog — record os.getppid() at startup, poll every few
+#      seconds, exit when the recorded parent is gone. Reliable on Windows
+#      because dead parents are NOT reparented to init (ppid stays pointing
+#      at the dead pid).
+#   2. Stdin EOF watchdog — read one byte from stdin in a background thread.
+#      Returns immediately on EOF when the host closes the pipe. (FastMCP's
+#      own stdio reader will get the same EOF and shut down cleanly first;
+#      this is the belt to its braces.)
+#
+# Both threads are daemon=True so they never block a normal shutdown.
+
+def _parent_watchdog(initial_ppid: int, poll_sec: float = 5.0) -> None:
+    if initial_ppid <= 1:
+        return
+    while True:
+        time.sleep(poll_sec)
+        try:
+            # On POSIX a dead pid raises OSError; on Windows os.kill(pid, 0)
+            # raises OSError too. Either way, a successful call means the
+            # PID is still alive (or has been recycled — we accept that
+            # tiny race because the alternative is leaking a process).
+            os.kill(initial_ppid, 0)
+        except OSError:
+            sys.stderr.write(
+                f"[whatsapp-mcp] parent pid {initial_ppid} gone, exiting\n"
+            )
+            sys.stderr.flush()
+            os._exit(0)
+
+
+def _stdin_eof_watchdog() -> None:
+    try:
+        # Block until the host closes stdin. We don't care about the byte
+        # itself — FastMCP's own reader has already consumed any real
+        # JSON-RPC frames. This thread only wakes up on EOF (host crash
+        # or pipe close).
+        data = sys.stdin.buffer.read(1)
+        if not data:
+            sys.stderr.write("[whatsapp-mcp] stdin EOF, exiting\n")
+            sys.stderr.flush()
+            os._exit(0)
+    except Exception:
+        # If sys.stdin.buffer is unusable (e.g. tests), just give up.
+        return
+
+
+def _install_orphan_watchdogs() -> None:
+    # Disable with an env var if a future MCP host wraps us in a way that
+    # confuses the watchdog (we haven't seen one yet, but it's cheap).
+    if os.environ.get("WHATSAPP_MCP_DISABLE_WATCHDOG", "").lower() in ("1", "true", "yes"):
+        return
+    ppid = os.getppid()
+    threading.Thread(
+        target=_parent_watchdog,
+        args=(ppid,),
+        name="whatsapp-mcp-parent-watchdog",
+        daemon=True,
+    ).start()
+    # The stdin watchdog races with FastMCP's own stdio reader. Skip it
+    # by default so we don't compete for the input pipe — the parent-PID
+    # watchdog alone is sufficient. Enable with WHATSAPP_MCP_STDIN_EOF=1
+    # if a future MCP transport ever needs the belt-and-braces guard.
+    if os.environ.get("WHATSAPP_MCP_STDIN_EOF", "").lower() in ("1", "true", "yes"):
+        threading.Thread(
+            target=_stdin_eof_watchdog,
+            name="whatsapp-mcp-stdin-watchdog",
+            daemon=True,
+        ).start()
+
 
 # Initialize FastMCP server
 mcp = FastMCP("whatsapp")
@@ -290,5 +375,9 @@ def sync_history(chat_jid: str, count: int = 50) -> Dict[str, Any]:
 
 
 if __name__ == "__main__":
+    # Install orphan-process watchdogs BEFORE entering FastMCP's blocking
+    # stdio loop. Without these, every ungraceful MCP-host crash leaks one
+    # python.exe that sits forever waiting for the next JSON-RPC frame.
+    _install_orphan_watchdogs()
     # Initialize and run the server
     mcp.run(transport='stdio')
