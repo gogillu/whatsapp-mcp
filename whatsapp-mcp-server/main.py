@@ -32,27 +32,101 @@ from whatsapp import (
 # host crash leaks one whatsapp-mcp python process.
 #
 # Two cheap watchdogs fix this:
-#   1. Parent-PID watchdog — record os.getppid() at startup, poll every few
-#      seconds, exit when the recorded parent is gone. Reliable on Windows
-#      because dead parents are NOT reparented to init (ppid stays pointing
-#      at the dead pid).
+#   1. Parent watchdog — wait for the SPECIFIC parent process to exit:
+#      * On Windows: OpenProcess(PROCESS_SYNCHRONIZE, ppid) + WaitForSingleObject
+#        on the resulting handle. The handle is bound to the kernel process
+#        object, not the PID, so PID reuse (which is aggressive on Windows
+#        and routinely defeats `os.kill(ppid, 0)` polling — re-allocates the
+#        dead parent's PID to a fresh unrelated process within seconds, so
+#        the kill check keeps reporting "alive" and the watchdog never
+#        fires) cannot mask the parent's death. This was the actual cause
+#        of every leaked python.exe with multi-day uptime that the user
+#        kept finding in Task Manager.
+#      * On POSIX: poll os.kill(ppid, 0). Dead parents are reaped, so kill(0)
+#        raises ESRCH cleanly. PID reuse on POSIX is much slower and the
+#        race is tolerable.
 #   2. Stdin EOF watchdog — read one byte from stdin in a background thread.
 #      Returns immediately on EOF when the host closes the pipe. (FastMCP's
 #      own stdio reader will get the same EOF and shut down cleanly first;
-#      this is the belt to its braces.)
+#      this is the belt to its braces.) Disabled by default because it
+#      competes with FastMCP for the stdin pipe.
 #
 # Both threads are daemon=True so they never block a normal shutdown.
 
-def _parent_watchdog(initial_ppid: int, poll_sec: float = 5.0) -> None:
-    if initial_ppid <= 1:
-        return
+def _parent_watchdog_windows(initial_ppid: int) -> None:
+    """Block on a Win32 handle to the parent process until it exits.
+
+    OpenProcess + WaitForSingleObject is the canonical "wait for parent
+    to die" pattern on Windows. The handle is bound to the specific
+    kernel process object, so the watchdog correctly detects parent
+    death even when the dead PID is later re-allocated to another
+    process. Polling-by-PID does NOT have this property and is the bug
+    we are fixing.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    PROCESS_SYNCHRONIZE = 0x00100000
+    INFINITE = 0xFFFFFFFF
+    WAIT_OBJECT_0 = 0x00000000
+    WAIT_FAILED = 0xFFFFFFFF
+    ERROR_ACCESS_DENIED = 5
+    ERROR_INVALID_PARAMETER = 87
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    OpenProcess = kernel32.OpenProcess
+    OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    OpenProcess.restype = wintypes.HANDLE
+    WaitForSingleObject = kernel32.WaitForSingleObject
+    WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    WaitForSingleObject.restype = wintypes.DWORD
+    CloseHandle = kernel32.CloseHandle
+    CloseHandle.argtypes = [wintypes.HANDLE]
+    CloseHandle.restype = wintypes.BOOL
+
+    h = OpenProcess(PROCESS_SYNCHRONIZE, False, initial_ppid)
+    if not h:
+        err = ctypes.get_last_error()
+        # ERROR_INVALID_PARAMETER usually means the PID is already gone.
+        # ERROR_ACCESS_DENIED means a sandboxed/elevated parent we can't
+        # touch — exit either way; the alternative is silently falling
+        # back to the broken poll path that caused this leak.
+        reason = "gone" if err == ERROR_INVALID_PARAMETER else (
+            "access denied" if err == ERROR_ACCESS_DENIED else f"err={err}"
+        )
+        sys.stderr.write(
+            f"[whatsapp-mcp] OpenProcess({initial_ppid}) failed ({reason}); "
+            f"orphaned at startup, exiting\n"
+        )
+        sys.stderr.flush()
+        os._exit(0)
+    try:
+        rc = WaitForSingleObject(h, INFINITE)
+    finally:
+        CloseHandle(h)
+    if rc == WAIT_OBJECT_0:
+        sys.stderr.write(
+            f"[whatsapp-mcp] parent pid {initial_ppid} exited, exiting\n"
+        )
+    elif rc == WAIT_FAILED:
+        sys.stderr.write(
+            f"[whatsapp-mcp] WaitForSingleObject(parent={initial_ppid}) "
+            f"failed (err={ctypes.get_last_error()}); exiting defensively\n"
+        )
+    else:
+        sys.stderr.write(
+            f"[whatsapp-mcp] WaitForSingleObject(parent={initial_ppid}) "
+            f"returned 0x{rc:08x}; exiting defensively\n"
+        )
+    sys.stderr.flush()
+    os._exit(0)
+
+
+def _parent_watchdog_posix(initial_ppid: int, poll_sec: float = 5.0) -> None:
+    """Poll the parent PID on POSIX. Dead PIDs raise ESRCH after reaping."""
     while True:
         time.sleep(poll_sec)
         try:
-            # On POSIX a dead pid raises OSError; on Windows os.kill(pid, 0)
-            # raises OSError too. Either way, a successful call means the
-            # PID is still alive (or has been recycled — we accept that
-            # tiny race because the alternative is leaking a process).
             os.kill(initial_ppid, 0)
         except OSError:
             sys.stderr.write(
@@ -84,14 +158,20 @@ def _install_orphan_watchdogs() -> None:
     if os.environ.get("WHATSAPP_MCP_DISABLE_WATCHDOG", "").lower() in ("1", "true", "yes"):
         return
     ppid = os.getppid()
+    if ppid <= 1:
+        return
+    if sys.platform == "win32":
+        target = _parent_watchdog_windows
+    else:
+        target = _parent_watchdog_posix
     threading.Thread(
-        target=_parent_watchdog,
+        target=target,
         args=(ppid,),
         name="whatsapp-mcp-parent-watchdog",
         daemon=True,
     ).start()
     # The stdin watchdog races with FastMCP's own stdio reader. Skip it
-    # by default so we don't compete for the input pipe — the parent-PID
+    # by default so we don't compete for the input pipe — the parent
     # watchdog alone is sufficient. Enable with WHATSAPP_MCP_STDIN_EOF=1
     # if a future MCP transport ever needs the belt-and-braces guard.
     if os.environ.get("WHATSAPP_MCP_STDIN_EOF", "").lower() in ("1", "true", "yes"):
