@@ -29,6 +29,7 @@ import (
 
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -1037,6 +1038,50 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Handler: fetch a contact/group's profile-picture URL. Read-only.
+	// GET /api/profile-picture?jid=<jid>[&preview=1]
+	// Returns {success, url, id, direct_path}. url is a short-lived
+	// pps.whatsapp.net HTTPS link the caller can download directly.
+	http.HandleFunc("/api/profile-picture", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		rawJID := strings.TrimSpace(r.URL.Query().Get("jid"))
+		if rawJID == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "jid query param required"})
+			return
+		}
+		jid, err := types.ParseJID(rawJID)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "invalid jid: " + err.Error()})
+			return
+		}
+		preview := r.URL.Query().Get("preview") == "1"
+		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+		defer cancel()
+		info, err := client.GetProfilePictureInfo(ctx, jid, &whatsmeow.GetProfilePictureParams{Preview: preview})
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]any{"success": false, "message": err.Error()})
+			return
+		}
+		if info == nil {
+			json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "no profile picture (private or none set)"})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"success":     true,
+			"url":         info.URL,
+			"id":          info.ID,
+			"type":        info.Type,
+			"direct_path": info.DirectPath,
+		})
+	})
+
 	// Bind to loopback only so the bridge isn't exposed on the LAN.
 	// Port is configurable via WHATSAPP_BRIDGE_PORT (default 9876, picked
 	// to avoid colliding with the god backend on 9871/9872/9873).
@@ -1082,6 +1127,19 @@ func main() {
 			logger.Errorf("Failed to get device: %v", err)
 			return
 		}
+	}
+
+	// v-stitch: request a FULL history sync at pair time so the companion
+	// receives the group history that WhatsApp shares when this account is
+	// added to a group ("history shared by <admin>"). The default companion
+	// registration only asks for a thin recent sync, which is why group
+	// history posted before this device was linked never reached the bridge.
+	// Harmless once already paired (DeviceProps is only read at registration).
+	store.DeviceProps.RequireFullSync = proto.Bool(true)
+	if store.DeviceProps.HistorySyncConfig != nil {
+		store.DeviceProps.HistorySyncConfig.FullSyncDaysLimit = proto.Uint32(90)
+		store.DeviceProps.HistorySyncConfig.FullSyncSizeMbLimit = proto.Uint32(2048)
+		store.DeviceProps.HistorySyncConfig.StorageQuotaMb = proto.Uint32(10240)
 	}
 
 	// Create client instance
