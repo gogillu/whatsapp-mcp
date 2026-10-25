@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -683,8 +684,12 @@ func extractDirectPathFromURL(url string) string {
 	return "/" + pathPart
 }
 
-// Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+// Start a REST API server to expose the WhatsApp client functionality.
+// ln is the loopback listener main() claimed before connecting to WhatsApp.
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, ln net.Listener) {
+	// /api/status + /api/groups/* (groups.go)
+	registerGroupRoutes(client)
+
 	// Handler: list all WhatsApp contacts known to the multi-device
 	// session. This is RELIABLE — whatsmeow keeps a synced contact
 	// store from the phone, with full names, push names, and business
@@ -1082,24 +1087,46 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
-	// Bind to loopback only so the bridge isn't exposed on the LAN.
-	// Port is configurable via WHATSAPP_BRIDGE_PORT (default 9876, picked
-	// to avoid colliding with the god backend on 9871/9872/9873).
-	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
-	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
+	// Bind to loopback only so the bridge isn't exposed on the LAN. The
+	// listener was claimed in main() before connecting to WhatsApp.
+	fmt.Printf("Starting REST API server on %s...\n", ln.Addr())
 
 	// Run server in a goroutine so it doesn't block
 	go func() {
-		if err := http.ListenAndServe(serverAddr, nil); err != nil {
+		if err := http.Serve(ln, nil); err != nil {
 			fmt.Printf("REST API server error: %v\n", err)
 		}
 	}()
+}
+
+// bridgePortFromEnv returns the REST port (WHATSAPP_BRIDGE_PORT, default 9876,
+// picked to avoid colliding with the god backend on 9871/9872/9873).
+func bridgePortFromEnv() int {
+	bridgePort := 9876
+	if v := strings.TrimSpace(os.Getenv("WHATSAPP_BRIDGE_PORT")); v != "" {
+		if p, err := strconv.Atoi(v); err == nil && p > 0 && p < 65536 {
+			bridgePort = p
+		}
+	}
+	return bridgePort
 }
 
 func main() {
 	// Set up logger
 	logger := waLog.Stdout("Client", "INFO", true)
 	logger.Infof("Starting WhatsApp client...")
+
+	// Single-instance guard: claim the REST port BEFORE touching the WhatsApp
+	// session. Two bridges on one session make WhatsApp kick the older
+	// connection ("stream replaced") - on 2026-10-25 a duplicate supervisor
+	// started a second bridge that could not bind :9876 but still connected,
+	// leaving the REST-serving bridge disconnected for hours. A bridge that
+	// cannot own the port now exits without ever connecting.
+	restListener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", bridgePortFromEnv()))
+	if err != nil {
+		logger.Errorf("REST port unavailable (%v) - another bridge instance owns it; exiting WITHOUT connecting to WhatsApp", err)
+		os.Exit(3)
+	}
 
 	// Create database connection for storing session data
 	dbLog := waLog.Stdout("Database", "INFO", true)
@@ -1170,6 +1197,15 @@ func main() {
 
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
+
+		case *events.StreamReplaced:
+			// Another client logged in with this session and WhatsApp closed
+			// ours. whatsmeow never auto-reconnects after this, so staying up
+			// would leave the REST API serving a dead connection. Exit and
+			// let the supervisor restart us (we still own the REST port, so
+			// no duplicate can be the one that reconnects).
+			logger.Errorf("WhatsApp stream replaced by another client - exiting so the supervisor restarts the bridge")
+			os.Exit(4)
 
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out, please scan QR code to log in again")
@@ -1252,15 +1288,7 @@ func main() {
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
-	// Start REST API server. Port is overridable via env so the bridge
-	// can dodge whatever the god backend is using on this machine.
-	bridgePort := 9876
-	if v := strings.TrimSpace(os.Getenv("WHATSAPP_BRIDGE_PORT")); v != "" {
-		if p, err := strconv.Atoi(v); err == nil && p > 0 && p < 65536 {
-			bridgePort = p
-		}
-	}
-	startRESTServer(client, messageStore, bridgePort)
+	startRESTServer(client, messageStore, restListener)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
