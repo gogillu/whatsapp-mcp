@@ -46,6 +46,13 @@ Here's an example of what you can do when it's connected to Claude.
 
    After approximately 20 days, you will might need to re-authenticate.
 
+   **Re-linking (this fork).** While the bridge is not linked - first run, or after WhatsApp logged the device out (the bridge then exits with code 5 so its supervisor restarts it straight into pairing mode) - it keeps offering fresh login sessions until it is linked:
+
+   - Every ~160 s session writes a new QR code to `WHATSAPP_QR_PATH` (default `C:\Users\arushi\apache-www\god\whatsapp\qr.png`) plus an auto-refreshing `index.html` next to it, served at `WHATSAPP_QR_URL` (default `https://gogillu.live/god/whatsapp/`).
+   - If the account's number is known (`WHATSAPP_PAIR_PHONE`, else `store/pair-phone.txt`, which the bridge refreshes on every login) each session also gets an 8-character pairing code, so you can link from the phone itself: WhatsApp > Linked devices > Link a device > **Link with phone number instead**. Code requests back off when WhatsApp refuses them.
+   - `GET /api/status` reports `logged_in:false` plus `pairing` (code, expiry) meanwhile; the REST API is served from startup.
+   - A link to any other number than the known one is logged out again immediately (exit 6). Delete `store/pair-phone.txt` to link a different account.
+
 3. **Connect to the MCP server**
 
    Copy the below json with the appropriate {{PATH}} values:
@@ -176,6 +183,7 @@ By default, just the metadata of the media is stored in the local database. The 
 
 - **QR Code Not Displaying**: If the QR code doesn't appear, try restarting the authentication script. If issues persist, check if your terminal supports displaying QR codes.
 - **WhatsApp Already Logged In**: If your session is already active, the Go bridge will automatically reconnect without showing a QR code.
+- **Logged Out By WhatsApp**: `<stream:error code="401"><conflict type="device_removed"/>` in the bridge log means WhatsApp unlinked the device (removed on the phone, or server-side - e.g. after bulk group adds). Re-link via the pairing page / code above.
 - **Device Limit Reached**: WhatsApp limits the number of linked devices. If you reach this limit, you'll need to remove an existing device from WhatsApp on your phone (Settings > Linked Devices).
 - **No Messages Loading**: After initial authentication, it can take several minutes for your message history to load, especially if you have many chats.
 - **WhatsApp Out of Sync**: If your WhatsApp messages get out of sync with the bridge, delete both database files (`whatsapp-bridge/store/messages.db` and `whatsapp-bridge/store/whatsapp.db`) and restart the bridge to re-authenticate.

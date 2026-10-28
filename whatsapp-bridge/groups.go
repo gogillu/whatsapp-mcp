@@ -329,6 +329,9 @@ func registerGroupRoutes(client *whatsmeow.Client) {
 		if client.Store.ID != nil {
 			out["jid"] = client.Store.ID.ToNonAD().String()
 		}
+		if ps := currentPairingStatus(); ps.Active {
+			out["pairing"] = ps
+		}
 		grpJSON(w, http.StatusOK, out)
 	})
 

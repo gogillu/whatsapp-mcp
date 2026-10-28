@@ -23,8 +23,6 @@ import (
 	"time"
 
 	_ "modernc.org/sqlite"
-	"github.com/mdp/qrterminal"
-	qrgen "rsc.io/qr"
 
 	"bytes"
 
@@ -1197,6 +1195,9 @@ func main() {
 
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
+			if client.Store.ID != nil {
+				markLinked(client.Store.ID.User)
+			}
 
 		case *events.StreamReplaced:
 			// Another client logged in with this session and WhatsApp closed
@@ -1208,87 +1209,49 @@ func main() {
 			os.Exit(4)
 
 		case *events.LoggedOut:
-			logger.Warnf("Device logged out, please scan QR code to log in again")
+			// WhatsApp unlinked this device (removed on the phone, or
+			// server-side). Staying up would serve a dead session forever,
+			// so exit and let the supervisor restart us into pairing mode
+			// (pairing.go). whatsmeow deletes the session concurrently with
+			// this event; give that a moment to finish first.
+			logger.Errorf("WhatsApp logged this device out (%s) - exiting so the supervisor restarts the bridge in pairing mode", v.Reason)
+			go func() {
+				time.Sleep(5 * time.Second)
+				os.Exit(exitLoggedOut)
+			}()
+
+		case *events.TemporaryBan:
+			logger.Errorf("WhatsApp temporarily banned this account: %s", v)
 		}
 	})
 
-	// Create channel to track connection success
-	connected := make(chan bool, 1)
+	// Serve REST before logging in, so while the bridge waits to be linked
+	// /api/status says so (with the live pairing code) instead of the port
+	// accepting connections that never get an answer.
+	startRESTServer(client, messageStore, restListener)
 
-	// Connect to WhatsApp
 	if client.Store.ID == nil {
-		// No ID stored, this is a new client, need to pair with phone
-		qrChan, _ := client.GetQRChannel(context.Background())
-		err = client.Connect()
-		if err != nil {
-			logger.Errorf("Failed to connect: %v", err)
+		// Not linked (first run, or WhatsApp logged this device out): offer
+		// QR + pairing codes until the account owner links it. The QR PNG
+		// path is overridable via WHATSAPP_QR_PATH so a second instance
+		// (e.g. the Business account on EC2) doesn't trample this one's.
+		if err := pairUntilLinked(client, logger); err != nil {
+			logger.Errorf("Pairing failed: %v", err)
 			return
 		}
-
-		// Print QR code for pairing with phone (terminal) AND write a PNG
-		// to apache so the user can scan it from a browser - the bridge
-		// often runs unattended via Task Scheduler where stdout is hidden.
-		// QR PNG output path is overridable via WHATSAPP_QR_PATH so a
-		// second instance (e.g. a Business account on EC2) can pair
-		// without trampling the personal account's QR file. An optional
-		// WHATSAPP_QR_URL prints a friendly scan-this-URL line.
-		qrPath := strings.TrimSpace(os.Getenv("WHATSAPP_QR_PATH"))
-		if qrPath == "" {
-			qrPath = `C:\Users\arushi\apache-www\god\whatsapp\qr.png`
-		}
-		qrURL := strings.TrimSpace(os.Getenv("WHATSAPP_QR_URL"))
-		for evt := range qrChan {
-			if evt.Event == "code" {
-				fmt.Println("\nScan this QR code with your WhatsApp app:")
-				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
-				if code, err := qrgen.Encode(evt.Code, qrgen.M); err == nil {
-					png := code.PNG()
-					_ = os.MkdirAll(filepath.Dir(qrPath), 0o755)
-					if err := os.WriteFile(qrPath, png, 0o644); err == nil {
-						fmt.Printf("QR PNG also written to %s\n", qrPath)
-						if qrURL != "" {
-							fmt.Printf("Open %s and scan with WhatsApp -> Linked devices.\n", qrURL)
-						} else {
-							fmt.Println("Open https://gogillu.in:9871/whatsapp/qr.png (or http://20.244.37.91/god/whatsapp/qr.png) and scan with WhatsApp -> Linked devices.")
-						}
-					}
-				}
-			} else if evt.Event == "success" {
-				connected <- true
-				_ = os.Remove(qrPath)
-				break
-			}
-		}
-
-		// Wait for connection
-		select {
-		case <-connected:
-			fmt.Println("\nSuccessfully connected and authenticated!")
-		case <-time.After(3 * time.Minute):
-			logger.Errorf("Timeout waiting for QR code scan")
-			return
-		}
-	} else {
-		// Already logged in, just connect
-		err = client.Connect()
-		if err != nil {
-			logger.Errorf("Failed to connect: %v", err)
-			return
-		}
-		connected <- true
+	} else if err := client.Connect(); err != nil {
+		logger.Errorf("Failed to connect: %v", err)
+		return
 	}
 
-	// Wait a moment for connection to stabilize
-	time.Sleep(2 * time.Second)
-
-	if !client.IsConnected() {
+	// After pairing WhatsApp restarts the socket once (whatsmeow reconnects
+	// by itself), so wait for a logged-in connection, not a fixed sleep.
+	if !waitLoggedIn(client, 30*time.Second) {
 		logger.Errorf("Failed to establish stable connection")
 		return
 	}
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
-
-	startRESTServer(client, messageStore, restListener)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
