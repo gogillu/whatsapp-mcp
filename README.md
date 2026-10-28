@@ -50,7 +50,7 @@ Here's an example of what you can do when it's connected to Claude.
 
    - Every ~160 s session writes a new QR code to `WHATSAPP_QR_PATH` (default `C:\Users\arushi\apache-www\god\whatsapp\qr.png`) plus an auto-refreshing `index.html` next to it, served at `WHATSAPP_QR_URL` (default `https://gogillu.live/god/whatsapp/`).
    - If the account's number is known (`WHATSAPP_PAIR_PHONE`, else `store/pair-phone.txt`, which the bridge refreshes on every login) each session also gets an 8-character pairing code, so you can link from the phone itself: WhatsApp > Linked devices > Link a device > **Link with phone number instead**. Code requests back off when WhatsApp refuses them.
-   - `GET /api/status` reports `logged_in:false` plus `pairing` (code, expiry) meanwhile; the REST API is served from startup.
+   - `GET /api/status` reports `logged_in:false` plus `pairing` (code, expiry) meanwhile; the REST API is served from startup, and every other endpoint answers `503 {"success":false,...}` until the device is linked.
    - A link to any other number than the known one is logged out again immediately (exit 6). Delete `store/pair-phone.txt` to link a different account.
 
 3. **Connect to the MCP server**

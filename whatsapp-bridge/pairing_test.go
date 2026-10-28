@@ -1,12 +1,41 @@
 package main
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestRequireLinked(t *testing.T) {
+	linked := false
+	h := requireLinked(func() bool { return linked }, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	for _, tc := range []struct {
+		path   string
+		linked bool
+		want   int
+	}{
+		{"/api/status", false, http.StatusTeapot},
+		{"/api/send", false, http.StatusServiceUnavailable},
+		{"/api/contacts", false, http.StatusServiceUnavailable},
+		{"/api/send", true, http.StatusTeapot},
+	} {
+		linked = tc.linked
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, tc.path, nil))
+		if rec.Code != tc.want {
+			t.Errorf("%s (linked=%v) = %d, want %d", tc.path, tc.linked, rec.Code, tc.want)
+		}
+		if tc.want == http.StatusServiceUnavailable && !strings.Contains(rec.Body.String(), `"success":false`) {
+			t.Errorf("%s unlinked body = %s, want a {success:false} JSON", tc.path, rec.Body)
+		}
+	}
+}
 
 func TestWritePairPage(t *testing.T) {
 	dir := t.TempDir()

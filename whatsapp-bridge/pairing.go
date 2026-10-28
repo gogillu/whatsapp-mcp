@@ -30,8 +30,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"html/template"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -295,6 +297,23 @@ func waitLoggedIn(client *whatsmeow.Client, timeout time.Duration) bool {
 		time.Sleep(250 * time.Millisecond)
 	}
 	return true
+}
+
+// requireLinked answers 503 for every REST call except /api/status while the
+// bridge isn't linked: a fresh device has no contact/identity stores until it
+// is paired, so most handlers would otherwise panic or fail obscurely.
+func requireLinked(linked func() bool, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/status" && !linked() {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(SendMessageResponse{
+				Message: "WhatsApp bridge is not linked to an account - waiting to be linked (see /api/status)",
+			})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // writePairPage publishes the status page as index.html next to qr.png,

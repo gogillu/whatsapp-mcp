@@ -1089,9 +1089,11 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, ln ne
 	// listener was claimed in main() before connecting to WhatsApp.
 	fmt.Printf("Starting REST API server on %s...\n", ln.Addr())
 
-	// Run server in a goroutine so it doesn't block
+	// Run server in a goroutine so it doesn't block. Until the device is
+	// linked only /api/status is answered (pairing.go).
 	go func() {
-		if err := http.Serve(ln, nil); err != nil {
+		linked := func() bool { return client.Store.ID != nil }
+		if err := http.Serve(ln, requireLinked(linked, http.DefaultServeMux)); err != nil {
 			fmt.Printf("REST API server error: %v\n", err)
 		}
 	}()
